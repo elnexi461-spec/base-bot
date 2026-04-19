@@ -3,9 +3,8 @@ from hexbytes import HexBytes
 
 import asyncio
 import json
-from collections import deque
+import time
 from dataclasses import dataclass
-from datetime import datetime, timezone
 from decimal import Decimal
 from os import getenv
 from typing import Any
@@ -15,9 +14,12 @@ from dotenv import load_dotenv
 from eth_account import Account
 from web3 import AsyncHTTPProvider, AsyncWeb3
 
-# ---------------------------------------------------------------------------
-# ABIs
-# ---------------------------------------------------------------------------
+DEFAULT_AAVE_SUBGRAPH_URL = "https://gateway.thegraph.com/api/subgraphs/id/GQFbb95cE6d8mV989mL5figjaGaKCQB3xqYrr1bRyXqF"
+DEFAULT_POOL_ADDRESSES_PROVIDER = "0xe20fCBdBfFC4Dd138cE8b2E6FBb6CB49777ad64D"
+DEFAULT_HANDS_CONTRACT = "0x5573d354c9a991c3d09c34eee775c499e629275e"
+WAD = Decimal("1000000000000000000")
+BPS = Decimal("10000")
+MULTICALL3 = "0xcA11bde05977b3631167028862bE2a173976CA11"
 
 POOL_ADDRESSES_PROVIDER_ABI = [
     {
@@ -40,42 +42,6 @@ POOL_ABI = [
             {"internalType": "uint256", "name": "currentLiquidationThreshold", "type": "uint256"},
             {"internalType": "uint256", "name": "ltv", "type": "uint256"},
             {"internalType": "uint256", "name": "healthFactor", "type": "uint256"},
-        ],
-        "stateMutability": "view",
-        "type": "function",
-    },
-    {
-        "inputs": [
-            {"internalType": "address", "name": "collateralAsset", "type": "address"},
-            {"internalType": "address", "name": "debtAsset", "type": "address"},
-            {"internalType": "address", "name": "user", "type": "address"},
-            {"internalType": "uint256", "name": "debtToCover", "type": "uint256"},
-            {"internalType": "bool", "name": "receiveAToken", "type": "bool"},
-        ],
-        "name": "liquidationCall",
-        "outputs": [],
-        "stateMutability": "nonpayable",
-        "type": "function",
-    },
-]
-
-PROTOCOL_DATA_PROVIDER_ABI = [
-    {
-        "inputs": [
-            {"internalType": "address", "name": "asset", "type": "address"},
-            {"internalType": "address", "name": "user", "type": "address"},
-        ],
-        "name": "getUserReserveData",
-        "outputs": [
-            {"internalType": "uint256", "name": "currentATokenBalance", "type": "uint256"},
-            {"internalType": "uint256", "name": "currentStableDebt", "type": "uint256"},
-            {"internalType": "uint256", "name": "currentVariableDebt", "type": "uint256"},
-            {"internalType": "uint256", "name": "principalStableDebt", "type": "uint256"},
-            {"internalType": "uint256", "name": "scaledVariableDebt", "type": "uint256"},
-            {"internalType": "uint256", "name": "stableBorrowRate", "type": "uint256"},
-            {"internalType": "uint256", "name": "liquidityRate", "type": "uint256"},
-            {"internalType": "uint40", "name": "stableRateLastUpdated", "type": "uint40"},
-            {"internalType": "bool", "name": "usageAsCollateralEnabled", "type": "bool"},
         ],
         "stateMutability": "view",
         "type": "function",
@@ -110,16 +76,36 @@ BASE_AAVE_HANDS_ABI = [
     },
 ]
 
-HANDS_ABI = BASE_AAVE_HANDS_ABI
-
-# ---------------------------------------------------------------------------
-# Config
-# ---------------------------------------------------------------------------
-
-DEFAULT_AAVE_SUBGRAPH_URL = "https://gateway.thegraph.com/api/subgraphs/id/GQFbb95cE6d8mV989mL5figjaGaKCQB3xqYrr1bRyXqF"
-DEFAULT_POOL_ADDRESSES_PROVIDER = "0xe20fCBdBfFC4Dd138cE8b2E6FBb6CB49777ad64D"
-DEFAULT_PROTOCOL_DATA_PROVIDER = "0x0F43731EB8d45A581f4a36DD74F5f358bc90C73A"
-DEFAULT_HANDS_CONTRACT = "0x5573d354c9a991c3d09c34eee775c499e629275e"
+MULTICALL3_ABI = [
+    {
+        "inputs": [
+            {
+                "components": [
+                    {"internalType": "address", "name": "target", "type": "address"},
+                    {"internalType": "bool", "name": "allowFailure", "type": "bool"},
+                    {"internalType": "bytes", "name": "callData", "type": "bytes"},
+                ],
+                "internalType": "struct Multicall3.Call3[]",
+                "name": "calls",
+                "type": "tuple[]",
+            }
+        ],
+        "name": "aggregate3",
+        "outputs": [
+            {
+                "components": [
+                    {"internalType": "bool", "name": "success", "type": "bool"},
+                    {"internalType": "bytes", "name": "returnData", "type": "bytes"},
+                ],
+                "internalType": "struct Multicall3.Result[]",
+                "name": "returnData",
+                "type": "tuple[]",
+            }
+        ],
+        "stateMutability": "payable",
+        "type": "function",
+    }
+]
 
 
 @dataclass(frozen=True)
@@ -132,7 +118,6 @@ class Settings:
     hands_contract: str
     subgraph_url: str = DEFAULT_AAVE_SUBGRAPH_URL
     pool_addresses_provider: str = DEFAULT_POOL_ADDRESSES_PROVIDER
-    protocol_data_provider: str = DEFAULT_PROTOCOL_DATA_PROVIDER
     chain_id: int = 8453
     execution_enabled: bool = True
     heartbeat_seconds: int = 10
@@ -146,6 +131,22 @@ class Settings:
     base_currency_decimals: int = 8
     require_gas_estimate: bool = True
     use_private_transaction_method: bool = False
+
+
+@dataclass(frozen=True)
+class BorrowerPosition:
+    user: str
+    debt_asset: str
+    collateral_asset: str
+    debt_base_usd: Decimal
+    collateral_base_usd: Decimal
+    health_factor: Decimal
+
+
+@dataclass(frozen=True)
+class Candidate:
+    position: BorrowerPosition
+    estimated_profit_usd: Decimal
 
 
 def env_bool(name: str, default: str = "false") -> bool:
@@ -183,7 +184,6 @@ def load_settings() -> Settings:
         hands_contract=getenv("HANDS_CONTRACT", DEFAULT_HANDS_CONTRACT),
         subgraph_url=getenv("AAVE_SUBGRAPH_URL", DEFAULT_AAVE_SUBGRAPH_URL),
         pool_addresses_provider=getenv("POOL_ADDRESSES_PROVIDER", DEFAULT_POOL_ADDRESSES_PROVIDER),
-        protocol_data_provider=getenv("PROTOCOL_DATA_PROVIDER", DEFAULT_PROTOCOL_DATA_PROVIDER),
         chain_id=env_int("CHAIN_ID", 8453),
         execution_enabled=env_bool("EXECUTION_ENABLED", "true"),
         heartbeat_seconds=env_int("HEARTBEAT_SECONDS", 10),
@@ -198,117 +198,6 @@ def load_settings() -> Settings:
         require_gas_estimate=env_bool("REQUIRE_GAS_ESTIMATE", "true"),
         use_private_transaction_method=env_bool("USE_PRIVATE_TRANSACTION_METHOD", "false"),
     )
-
-# ---------------------------------------------------------------------------
-# Constants
-# ---------------------------------------------------------------------------
-
-WAD = Decimal("1000000000000000000")
-BPS = Decimal("10000")
-MULTICALL3 = "0xcA11bde05977b3631167028862bE2a173976CA11"
-MULTICALL3_ABI = [
-    {
-        "inputs": [
-            {
-                "components": [
-                    {"internalType": "address", "name": "target", "type": "address"},
-                    {"internalType": "bool", "name": "allowFailure", "type": "bool"},
-                    {"internalType": "bytes", "name": "callData", "type": "bytes"},
-                ],
-                "internalType": "struct Multicall3.Call3[]",
-                "name": "calls",
-                "type": "tuple[]",
-            }
-        ],
-        "name": "aggregate3",
-        "outputs": [
-            {
-                "components": [
-                    {"internalType": "bool", "name": "success", "type": "bool"},
-                    {"internalType": "bytes", "name": "returnData", "type": "bytes"},
-                ],
-                "internalType": "struct Multicall3.Result[]",
-                "name": "returnData",
-                "type": "tuple[]",
-            }
-        ],
-        "stateMutability": "payable",
-        "type": "function",
-    }
-]
-
-
-@dataclass(frozen=True)
-class BorrowerPosition:
-    user: str
-    debt_asset: str
-    collateral_asset: str
-    debt_base_usd: Decimal
-    collateral_base_usd: Decimal
-    health_factor: Decimal
-
-
-@dataclass(frozen=True)
-class Candidate:
-    position: BorrowerPosition
-    estimated_profit_usd: Decimal
-
-
-class OpportunitiesTracker:
-    """In-memory opportunity tracker. Keeps the last `max_size` records."""
-
-    _MAX_SIZE = 1000
-
-    def __init__(self) -> None:
-        self._records: deque[dict[str, Any]] = deque(maxlen=self._MAX_SIZE)
-
-    def record(
-        self,
-        kind: str,
-        position: Any,
-        estimated_profit_usd: Decimal,
-        execution_enabled: bool,
-        status: str,
-        tx_hash: str | None = None,
-    ) -> None:
-        self._records.append(
-            {
-                "observed_at": datetime.now(timezone.utc).isoformat(),
-                "kind": kind,
-                "user": position.user,
-                "debt_asset": position.debt_asset,
-                "collateral_asset": position.collateral_asset,
-                "health_factor": str(position.health_factor),
-                "debt_base_usd": str(position.debt_base_usd),
-                "collateral_base_usd": str(position.collateral_base_usd),
-                "estimated_profit_usd": str(estimated_profit_usd),
-                "execution_enabled": execution_enabled,
-                "status": status,
-                "tx_hash": tx_hash,
-            }
-        )
-
-    def recent_summary(self) -> dict[str, Any]:
-        cutoff = datetime.now(timezone.utc).timestamp() - 86400
-        counts: dict[tuple[str, str], dict[str, Any]] = {}
-        for record in self._records:
-            try:
-                observed = datetime.fromisoformat(record["observed_at"]).timestamp()
-            except (ValueError, KeyError):
-                continue
-            if observed < cutoff:
-                continue
-            key = (record["kind"], record["status"])
-            if key not in counts:
-                counts[key] = {"kind": record["kind"], "status": record["status"], "count": 0, "estimatedProfitUsd": 0.0}
-            counts[key]["count"] += 1
-            try:
-                counts[key]["estimatedProfitUsd"] += float(record["estimated_profit_usd"])
-            except (ValueError, TypeError):
-                pass
-        return {
-            "last24h": sorted(counts.values(), key=lambda r: (r["kind"], r["status"]))
-        }
 
 
 class BaseSearcher:
@@ -331,7 +220,10 @@ class BaseSearcher:
             abi=MULTICALL3_ABI,
         )
         self.blocked_assets = self._address_set(getenv("BLOCKED_ASSETS", ""))
-        self.opportunities = OpportunitiesTracker()
+        self.opportunities: dict[str, list[dict[str, Any]]] = {
+            "liquidation": [],
+            "rebalance_watchlist": [],
+        }
 
     def _address_set(self, csv_value: str) -> set[str]:
         return {
@@ -342,6 +234,44 @@ class BaseSearcher:
 
     def log(self, level: str, **payload: Any) -> None:
         print(json.dumps({"level": level, **payload}, default=str), flush=True)
+
+    def record_opportunity(self, kind: str, position: BorrowerPosition, estimated_profit_usd: Decimal, status: str, tx_hash: str | None = None) -> None:
+        bucket = self.opportunities.setdefault(kind, [])
+        bucket.append(
+            {
+                "observedAt": time.time(),
+                "user": position.user,
+                "debtAsset": position.debt_asset,
+                "collateralAsset": position.collateral_asset,
+                "healthFactor": str(position.health_factor),
+                "debtBaseUsd": str(position.debt_base_usd),
+                "collateralBaseUsd": str(position.collateral_base_usd),
+                "estimatedProfitUsd": str(estimated_profit_usd),
+                "status": status,
+                "txHash": tx_hash,
+            }
+        )
+        if len(bucket) > 10000:
+            del bucket[: len(bucket) - 10000]
+
+    def opportunity_summary(self) -> dict[str, Any]:
+        cutoff = time.time() - 86400
+        summary = []
+        for kind, rows in self.opportunities.items():
+            recent = [row for row in rows if row["observedAt"] >= cutoff]
+            statuses = sorted({row["status"] for row in recent})
+            for status in statuses:
+                matching = [row for row in recent if row["status"] == status]
+                estimated_profit = sum(Decimal(row["estimatedProfitUsd"]) for row in matching)
+                summary.append(
+                    {
+                        "kind": kind,
+                        "status": status,
+                        "count": len(matching),
+                        "estimatedProfitUsd": estimated_profit,
+                    }
+                )
+        return {"last24h": summary}
 
     async def start(self) -> None:
         await self.validate_runtime()
@@ -384,33 +314,15 @@ class BaseSearcher:
         candidates = self.pick_candidates(positions)
         rebalance_watchlist = self.pick_rebalance_watchlist(positions)
         for candidate in candidates:
-            self.opportunities.record(
-                kind="liquidation",
-                position=candidate.position,
-                estimated_profit_usd=candidate.estimated_profit_usd,
-                execution_enabled=self.settings.execution_enabled,
-                status="candidate",
-            )
+            self.record_opportunity("liquidation", candidate.position, candidate.estimated_profit_usd, "candidate")
         for position in rebalance_watchlist:
-            self.opportunities.record(
-                kind="rebalance_watchlist",
-                position=position,
-                estimated_profit_usd=Decimal("0"),
-                execution_enabled=False,
-                status="watching",
-            )
+            self.record_opportunity("rebalance_watchlist", position, Decimal("0"), "watching")
+
         executed = 0
         if candidates and self.settings.execution_enabled:
             for candidate in candidates[: self.settings.max_candidates_per_tick]:
                 tx_hash = await self.execute_candidate(candidate)
-                self.opportunities.record(
-                    kind="liquidation",
-                    position=candidate.position,
-                    estimated_profit_usd=candidate.estimated_profit_usd,
-                    execution_enabled=True,
-                    status="sent",
-                    tx_hash=tx_hash,
-                )
+                self.record_opportunity("liquidation", candidate.position, candidate.estimated_profit_usd, "sent", tx_hash)
                 executed += 1
                 self.log(
                     "info",
@@ -423,6 +335,7 @@ class BaseSearcher:
                 )
         elif candidates:
             self.log("info", message="candidates_found_execution_disabled", candidates=len(candidates))
+
         if rebalance_watchlist:
             self.log(
                 "info",
@@ -446,7 +359,7 @@ class BaseSearcher:
             rebalanceWatchlist=len(rebalance_watchlist),
             executed=executed,
             executionEnabled=self.settings.execution_enabled,
-            opportunitySummary=self.opportunities.recent_summary(),
+            opportunitySummary=self.opportunity_summary(),
         )
         await asyncio.sleep(self.settings.heartbeat_seconds)
 
@@ -470,7 +383,7 @@ class BaseSearcher:
           }
         }
         """
-        headers = {"Authorization": f"Bearer {getenv('GRAPH_API_KEY', self.settings.graph_api_key)}"}
+        headers = {"Authorization": f"Bearer {self.settings.graph_api_key}"}
         variables = {"first": min(self.settings.subgraph_page_size, self.settings.borrower_limit * 10)}
         timeout = aiohttp.ClientTimeout(total=25)
         async with aiohttp.ClientSession(timeout=timeout) as session:
