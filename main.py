@@ -3,7 +3,9 @@ from hexbytes import HexBytes
 
 import asyncio
 import json
+from collections import deque
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from decimal import Decimal
 from os import getenv
 from typing import Any
@@ -13,9 +15,193 @@ from dotenv import load_dotenv
 from eth_account import Account
 from web3 import AsyncHTTPProvider, AsyncWeb3
 
-from abis import BASE_AAVE_HANDS_ABI, POOL_ABI, POOL_ADDRESSES_PROVIDER_ABI
-from config import Settings, load_settings
-from opportunity_store import OpportunityStore
+# ---------------------------------------------------------------------------
+# ABIs
+# ---------------------------------------------------------------------------
+
+POOL_ADDRESSES_PROVIDER_ABI = [
+    {
+        "inputs": [],
+        "name": "getPool",
+        "outputs": [{"internalType": "address", "name": "", "type": "address"}],
+        "stateMutability": "view",
+        "type": "function",
+    }
+]
+
+POOL_ABI = [
+    {
+        "inputs": [{"internalType": "address", "name": "user", "type": "address"}],
+        "name": "getUserAccountData",
+        "outputs": [
+            {"internalType": "uint256", "name": "totalCollateralBase", "type": "uint256"},
+            {"internalType": "uint256", "name": "totalDebtBase", "type": "uint256"},
+            {"internalType": "uint256", "name": "availableBorrowsBase", "type": "uint256"},
+            {"internalType": "uint256", "name": "currentLiquidationThreshold", "type": "uint256"},
+            {"internalType": "uint256", "name": "ltv", "type": "uint256"},
+            {"internalType": "uint256", "name": "healthFactor", "type": "uint256"},
+        ],
+        "stateMutability": "view",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"internalType": "address", "name": "collateralAsset", "type": "address"},
+            {"internalType": "address", "name": "debtAsset", "type": "address"},
+            {"internalType": "address", "name": "user", "type": "address"},
+            {"internalType": "uint256", "name": "debtToCover", "type": "uint256"},
+            {"internalType": "bool", "name": "receiveAToken", "type": "bool"},
+        ],
+        "name": "liquidationCall",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+]
+
+PROTOCOL_DATA_PROVIDER_ABI = [
+    {
+        "inputs": [
+            {"internalType": "address", "name": "asset", "type": "address"},
+            {"internalType": "address", "name": "user", "type": "address"},
+        ],
+        "name": "getUserReserveData",
+        "outputs": [
+            {"internalType": "uint256", "name": "currentATokenBalance", "type": "uint256"},
+            {"internalType": "uint256", "name": "currentStableDebt", "type": "uint256"},
+            {"internalType": "uint256", "name": "currentVariableDebt", "type": "uint256"},
+            {"internalType": "uint256", "name": "principalStableDebt", "type": "uint256"},
+            {"internalType": "uint256", "name": "scaledVariableDebt", "type": "uint256"},
+            {"internalType": "uint256", "name": "stableBorrowRate", "type": "uint256"},
+            {"internalType": "uint256", "name": "liquidityRate", "type": "uint256"},
+            {"internalType": "uint40", "name": "stableRateLastUpdated", "type": "uint40"},
+            {"internalType": "bool", "name": "usageAsCollateralEnabled", "type": "bool"},
+        ],
+        "stateMutability": "view",
+        "type": "function",
+    }
+]
+
+BASE_AAVE_HANDS_ABI = [
+    {
+        "inputs": [
+            {"internalType": "address", "name": "userAddress", "type": "address"},
+            {"internalType": "address", "name": "debtAsset", "type": "address"},
+            {"internalType": "address", "name": "collateralAsset", "type": "address"},
+        ],
+        "name": "executeLiquidation",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+    {
+        "inputs": [
+            {"internalType": "address", "name": "proxy", "type": "address"},
+            {"internalType": "address", "name": "service", "type": "address"},
+            {"internalType": "address", "name": "debtAsset", "type": "address"},
+            {"internalType": "address", "name": "rewardAsset", "type": "address"},
+            {"internalType": "uint256", "name": "amount", "type": "uint256"},
+            {"internalType": "bytes", "name": "serviceCallData", "type": "bytes"},
+        ],
+        "name": "executeRebalance",
+        "outputs": [],
+        "stateMutability": "nonpayable",
+        "type": "function",
+    },
+]
+
+HANDS_ABI = BASE_AAVE_HANDS_ABI
+
+# ---------------------------------------------------------------------------
+# Config
+# ---------------------------------------------------------------------------
+
+DEFAULT_AAVE_SUBGRAPH_URL = "https://gateway.thegraph.com/api/subgraphs/id/GQFbb95cE6d8mV989mL5figjaGaKCQB3xqYrr1bRyXqF"
+DEFAULT_POOL_ADDRESSES_PROVIDER = "0xe20fCBdBfFC4Dd138cE8b2E6FBb6CB49777ad64D"
+DEFAULT_PROTOCOL_DATA_PROVIDER = "0x0F43731EB8d45A581f4a36DD74F5f358bc90C73A"
+DEFAULT_HANDS_CONTRACT = "0x5573d354c9a991c3d09c34eee775c499e629275e"
+
+
+@dataclass(frozen=True)
+class Settings:
+    graph_api_key: str
+    rpc_url: str
+    private_rpc_url: str
+    private_key: str
+    wallet_address: str
+    hands_contract: str
+    subgraph_url: str = DEFAULT_AAVE_SUBGRAPH_URL
+    pool_addresses_provider: str = DEFAULT_POOL_ADDRESSES_PROVIDER
+    protocol_data_provider: str = DEFAULT_PROTOCOL_DATA_PROVIDER
+    chain_id: int = 8453
+    execution_enabled: bool = True
+    heartbeat_seconds: int = 10
+    borrower_limit: int = 100
+    subgraph_page_size: int = 1000
+    max_candidates_per_tick: int = 3
+    min_profit_usd: Decimal = Decimal("1")
+    liquidation_bonus_bps: Decimal = Decimal("500")
+    flashloan_fee_bps: Decimal = Decimal("9")
+    max_priority_fee_cap_gwei: Decimal = Decimal("2")
+    base_currency_decimals: int = 8
+    require_gas_estimate: bool = True
+    use_private_transaction_method: bool = False
+
+
+def env_bool(name: str, default: str = "false") -> bool:
+    return getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
+
+
+def env_int(name: str, default: int) -> int:
+    raw = getenv(name)
+    return default if raw is None or raw.strip() == "" else int(raw)
+
+
+def env_decimal(name: str, default: str) -> Decimal:
+    raw = getenv(name)
+    return Decimal(default if raw is None or raw.strip() == "" else raw)
+
+
+def load_settings() -> Settings:
+    required = {
+        "GRAPH_API_KEY": getenv("GRAPH_API_KEY", ""),
+        "BASE_RPC_URL": getenv("BASE_RPC_URL", ""),
+        "PRIVATE_RPC_URL": getenv("PRIVATE_RPC_URL", ""),
+        "PRIVATE_KEY": getenv("PRIVATE_KEY", ""),
+        "WALLET_ADDRESS": getenv("WALLET_ADDRESS", ""),
+    }
+    missing = [key for key, value in required.items() if not value]
+    if missing:
+        raise RuntimeError(f"Missing environment variables: {', '.join(missing)}")
+
+    return Settings(
+        graph_api_key=required["GRAPH_API_KEY"],
+        rpc_url=required["BASE_RPC_URL"],
+        private_rpc_url=required["PRIVATE_RPC_URL"],
+        private_key=required["PRIVATE_KEY"],
+        wallet_address=required["WALLET_ADDRESS"],
+        hands_contract=getenv("HANDS_CONTRACT", DEFAULT_HANDS_CONTRACT),
+        subgraph_url=getenv("AAVE_SUBGRAPH_URL", DEFAULT_AAVE_SUBGRAPH_URL),
+        pool_addresses_provider=getenv("POOL_ADDRESSES_PROVIDER", DEFAULT_POOL_ADDRESSES_PROVIDER),
+        protocol_data_provider=getenv("PROTOCOL_DATA_PROVIDER", DEFAULT_PROTOCOL_DATA_PROVIDER),
+        chain_id=env_int("CHAIN_ID", 8453),
+        execution_enabled=env_bool("EXECUTION_ENABLED", "true"),
+        heartbeat_seconds=env_int("HEARTBEAT_SECONDS", 10),
+        borrower_limit=env_int("BORROWER_LIMIT", 100),
+        subgraph_page_size=env_int("SUBGRAPH_PAGE_SIZE", 1000),
+        max_candidates_per_tick=env_int("MAX_CANDIDATES_PER_TICK", 3),
+        min_profit_usd=env_decimal("MIN_PROFIT_USD", "1"),
+        liquidation_bonus_bps=env_decimal("LIQUIDATION_BONUS_BPS", "500"),
+        flashloan_fee_bps=env_decimal("FLASHLOAN_FEE_BPS", "9"),
+        max_priority_fee_cap_gwei=env_decimal("MAX_PRIORITY_FEE_CAP_GWEI", "2"),
+        base_currency_decimals=env_int("BASE_CURRENCY_DECIMALS", 8),
+        require_gas_estimate=env_bool("REQUIRE_GAS_ESTIMATE", "true"),
+        use_private_transaction_method=env_bool("USE_PRIVATE_TRANSACTION_METHOD", "false"),
+    )
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
 
 WAD = Decimal("1000000000000000000")
 BPS = Decimal("10000")
@@ -68,6 +254,63 @@ class Candidate:
     estimated_profit_usd: Decimal
 
 
+class OpportunitiesTracker:
+    """In-memory opportunity tracker. Keeps the last `max_size` records."""
+
+    _MAX_SIZE = 1000
+
+    def __init__(self) -> None:
+        self._records: deque[dict[str, Any]] = deque(maxlen=self._MAX_SIZE)
+
+    def record(
+        self,
+        kind: str,
+        position: Any,
+        estimated_profit_usd: Decimal,
+        execution_enabled: bool,
+        status: str,
+        tx_hash: str | None = None,
+    ) -> None:
+        self._records.append(
+            {
+                "observed_at": datetime.now(timezone.utc).isoformat(),
+                "kind": kind,
+                "user": position.user,
+                "debt_asset": position.debt_asset,
+                "collateral_asset": position.collateral_asset,
+                "health_factor": str(position.health_factor),
+                "debt_base_usd": str(position.debt_base_usd),
+                "collateral_base_usd": str(position.collateral_base_usd),
+                "estimated_profit_usd": str(estimated_profit_usd),
+                "execution_enabled": execution_enabled,
+                "status": status,
+                "tx_hash": tx_hash,
+            }
+        )
+
+    def recent_summary(self) -> dict[str, Any]:
+        cutoff = datetime.now(timezone.utc).timestamp() - 86400
+        counts: dict[tuple[str, str], dict[str, Any]] = {}
+        for record in self._records:
+            try:
+                observed = datetime.fromisoformat(record["observed_at"]).timestamp()
+            except (ValueError, KeyError):
+                continue
+            if observed < cutoff:
+                continue
+            key = (record["kind"], record["status"])
+            if key not in counts:
+                counts[key] = {"kind": record["kind"], "status": record["status"], "count": 0, "estimatedProfitUsd": 0.0}
+            counts[key]["count"] += 1
+            try:
+                counts[key]["estimatedProfitUsd"] += float(record["estimated_profit_usd"])
+            except (ValueError, TypeError):
+                pass
+        return {
+            "last24h": sorted(counts.values(), key=lambda r: (r["kind"], r["status"]))
+        }
+
+
 class BaseSearcher:
     def __init__(self, settings: Settings):
         self.settings = settings
@@ -88,7 +331,7 @@ class BaseSearcher:
             abi=MULTICALL3_ABI,
         )
         self.blocked_assets = self._address_set(getenv("BLOCKED_ASSETS", ""))
-        self.opportunities = OpportunityStore(settings.opportunities_db_path)
+        self.opportunities = OpportunitiesTracker()
 
     def _address_set(self, csv_value: str) -> set[str]:
         return {
