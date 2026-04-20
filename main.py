@@ -3,6 +3,7 @@ from hexbytes import HexBytes
 
 import asyncio
 import json
+import os
 import time
 from dataclasses import dataclass
 from decimal import Decimal
@@ -368,9 +369,10 @@ class BaseSearcher:
             raise RuntimeError("Pool is not initialized")
 
         query = """
-        query TopBorrowers($first: Int!) {
+        query TopBorrowers($skip: Int!) {
           userReserves(
-            first: $first
+            first: 1000
+            skip: $skip
             orderBy: currentTotalDebt
             orderDirection: desc
             where: { currentTotalDebt_gt: "0" }
@@ -383,23 +385,31 @@ class BaseSearcher:
           }
         }
         """
-        headers = {"Authorization": f"Bearer {self.settings.graph_api_key}"}
-        variables = {"first": min(self.settings.subgraph_page_size, self.settings.borrower_limit * 10)}
+        headers = {"Authorization": f"Bearer {os.environ['GRAPH_API_KEY']}"}
         timeout = aiohttp.ClientTimeout(total=25)
+        all_reserves: list[dict[str, Any]] = []
+        skip = 0
         async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(
-                self.settings.subgraph_url,
-                json={"query": query, "variables": variables},
-                headers=headers,
-            ) as response:
-                payload = await response.json(content_type=None)
-                if response.status >= 400:
-                    raise RuntimeError(f"Subgraph HTTP {response.status}: {payload}")
+            while True:
+                variables = {"skip": skip}
+                async with session.post(
+                    self.settings.subgraph_url,
+                    json={"query": query, "variables": variables},
+                    headers=headers,
+                ) as response:
+                    payload = await response.json(content_type=None)
+                    if response.status >= 400:
+                        raise RuntimeError(f"Subgraph HTTP {response.status}: {payload}")
+                if payload.get("errors"):
+                    raise RuntimeError(f"Subgraph errors: {payload['errors']}")
+                page = payload.get("data", {}).get("userReserves", [])
+                all_reserves.extend(page)
+                if len(page) < 1000:
+                    break
+                skip += 1000
 
-        if payload.get("errors"):
-            raise RuntimeError(f"Subgraph errors: {payload['errors']}")
-
-        grouped = self._group_user_reserves(payload.get("data", {}).get("userReserves", []))
+        self.log("info", message="subgraph_fetch_complete", total_user_reserves=len(all_reserves))
+        grouped = self._group_user_reserves(all_reserves)
         positions = await self._hydrate_positions(grouped)
         return positions[: self.settings.borrower_limit]
 
