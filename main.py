@@ -14,7 +14,7 @@ from dotenv import load_dotenv
 from eth_account import Account
 from web3 import AsyncHTTPProvider, AsyncWeb3
 
-DEFAULT_AAVE_SUBGRAPH_URL = "https://gateway.thegraph.com/api/subgraphs/id/GQFbb95cE6d8mV989mL5figjaGaKCQB3xqYrr1bRyXqF"
+DEFAULT_AAVE_SUBGRAPH_DEPLOYMENT_ID = "GQFbb95cE6d8mV989mL5figjaGaKCQB3xqYrr1bRyXqF"
 DEFAULT_POOL_ADDRESSES_PROVIDER = "0xe20fCBdBfFC4Dd138cE8b2E6FBb6CB49777ad64D"
 DEFAULT_HANDS_CONTRACT = "0x5573d354c9a991c3d09c34eee775c499e629275e"
 WAD = Decimal("1000000000000000000")
@@ -116,7 +116,7 @@ class Settings:
     private_key: str
     wallet_address: str
     hands_contract: str
-    subgraph_url: str = DEFAULT_AAVE_SUBGRAPH_URL
+    subgraph_url: str
     pool_addresses_provider: str = DEFAULT_POOL_ADDRESSES_PROVIDER
     chain_id: int = 8453
     execution_enabled: bool = True
@@ -182,7 +182,10 @@ def load_settings() -> Settings:
         private_key=required["PRIVATE_KEY"],
         wallet_address=required["WALLET_ADDRESS"],
         hands_contract=getenv("HANDS_CONTRACT", DEFAULT_HANDS_CONTRACT),
-        subgraph_url=getenv("AAVE_SUBGRAPH_URL", DEFAULT_AAVE_SUBGRAPH_URL),
+        subgraph_url=getenv(
+            "AAVE_SUBGRAPH_URL",
+            f"https://gateway.thegraph.com/api/{required['GRAPH_API_KEY']}/subgraphs/id/{DEFAULT_AAVE_SUBGRAPH_DEPLOYMENT_ID}",
+        ),
         pool_addresses_provider=getenv("POOL_ADDRESSES_PROVIDER", DEFAULT_POOL_ADDRESSES_PROVIDER),
         chain_id=env_int("CHAIN_ID", 8453),
         execution_enabled=env_bool("EXECUTION_ENABLED", "true"),
