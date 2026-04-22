@@ -1,0 +1,31 @@
+Act as a Senior DeFi Engineer and Security Auditor. I have imported a liquidation bot from GitHub; perform a full 'Start-to-Finish' deployment and optimization cycle using the following protocol:
+
+1. CONSOLE-DRIVEN DEBUGGING: > * Run pnpm install, pnpm run build, and pnpm run start.
+
+Observe the console for errors (DNS, error.thegraph.com, Pimlico 401s, or TypeErrors).
+
+Auto-Fix Loop: For every error found, modify the code, rebuild, and re-run until the console shows a perfectly clean startup and successful Aave Subgraph scan.
+
+2. INFRASTRUCTURE & API UPGRADE: > * Replace all legacy Graph URLs with the stable Aave V3 API: https://api.v3.aave.com/graphql.
+
+Disable Pimlico Paymasters; configure the bot to use EOA (Direct ETH) gas payment from my Secrets.
+
+Pro-Strategy: Implement Websocket (WSS) providers instead of HTTP where possible to reduce latency for faster execution.
+
+3. SMART CONTRACT CROSS-AUDIT: > * Locate the deployed contract address in my Secrets/Config.
+
+Compare the JavaScript/TypeScript execution logic against the .sol files in the repo.
+
+Ensure function signatures (like executeOperation) match exactly. Verify the bot handles the Aave V3 'Premium' (flash loan fee) correctly to prevent reverts.
+
+4. PROFIT & SECURITY MAXIMIZATION: > * Gas Strategy: Implement a dynamic gas price fetcher that adds a small 'tip' (Priority Fee) to ensure our liquidation transactions are included in the next block.
+
+Slippage Protection: Add a check to ensure the liquidated collateral value is at least 1% higher than the flash loan debt + gas cost before firing.
+
+5. GITHUB & RAILWAY SYNC: > * Once the bot is 'Perfect' in the console, create a Pull Request to my GitHub repo with all fixes so my Railway deployment can auto-update.
+
+Create a 'Soft Copy' (a README_FIXED.md or summary file) documenting all changes made.
+
+6. LIVE ACTIVATION: > * Switch DRY_RUN to false. Run the final build.
+
+Final Verification: Monitor the live logs for 120 seconds. Do not stop until you confirm the bot is 'Hunting on Mainnet' with a verified connection to the Aave Pool and my deployed contract.

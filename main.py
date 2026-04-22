@@ -14,12 +14,30 @@ from dotenv import load_dotenv
 from eth_account import Account
 from web3 import AsyncHTTPProvider, AsyncWeb3
 
+load_dotenv()
+
+# ---------------------------------------------------------------------------
+# Constants
+# ---------------------------------------------------------------------------
+
 DEFAULT_AAVE_SUBGRAPH_URL = "https://gateway.thegraph.com/api/subgraphs/id/GQFbb95cE6d8mV989mL5figjaGaKCQB3xqYrr1bRyXqF"
+AAVE_V3_API_URL = "https://api.v3.aave.com/graphql"
 DEFAULT_POOL_ADDRESSES_PROVIDER = "0xe20fCBdBfFC4Dd138cE8b2E6FBb6CB49777ad64D"
 DEFAULT_HANDS_CONTRACT = "0x5573d354c9a991c3d09c34eee775c499e629275e"
 WAD = Decimal("1000000000000000000")
 BPS = Decimal("10000")
 MULTICALL3 = "0xcA11bde05977b3631167028862bE2a173976CA11"
+
+# Minimum collateral-to-debt coverage ratio before firing a liquidation.
+# Ensures collateral seized > (flash loan debt + gas) by at least this margin.
+MIN_COLLATERAL_COVERAGE = Decimal("1.01")
+
+# Flash loan fee (Aave V3 = 9 bps = 0.09 %)
+AAVE_FLASH_LOAN_FEE_BPS = Decimal("9")
+
+# ---------------------------------------------------------------------------
+# ABI definitions
+# ---------------------------------------------------------------------------
 
 POOL_ADDRESSES_PROVIDER_ABI = [
     {
@@ -48,6 +66,10 @@ POOL_ABI = [
     }
 ]
 
+# executeLiquidation(userAddress, debtAsset, collateralAsset)
+# executeOperation signature matches Aave V3 flash loan callback:
+#   executeOperation(address[] assets, uint256[] amounts, uint256[] premiums, address initiator, bytes calldata params)
+# The HANDS contract wraps this internally — callers only need executeLiquidation.
 BASE_AAVE_HANDS_ABI = [
     {
         "inputs": [
@@ -107,6 +129,10 @@ MULTICALL3_ABI = [
     }
 ]
 
+# ---------------------------------------------------------------------------
+# Data classes
+# ---------------------------------------------------------------------------
+
 
 @dataclass(frozen=True)
 class Settings:
@@ -126,11 +152,16 @@ class Settings:
     max_candidates_per_tick: int = 3
     min_profit_usd: Decimal = Decimal("1")
     liquidation_bonus_bps: Decimal = Decimal("500")
-    flashloan_fee_bps: Decimal = Decimal("9")
+    flashloan_fee_bps: Decimal = AAVE_FLASH_LOAN_FEE_BPS
     max_priority_fee_cap_gwei: Decimal = Decimal("2")
     base_currency_decimals: int = 8
     require_gas_estimate: bool = True
     use_private_transaction_method: bool = False
+    # WSS providers (optional — falls back to HTTP if not set)
+    base_wss_url: str = ""
+    private_wss_url: str = ""
+    # Slippage guard: collateral must cover debt + fee + gas by this factor
+    min_collateral_coverage: Decimal = MIN_COLLATERAL_COVERAGE
 
 
 @dataclass(frozen=True)
@@ -149,6 +180,11 @@ class Candidate:
     estimated_profit_usd: Decimal
 
 
+# ---------------------------------------------------------------------------
+# Helpers
+# ---------------------------------------------------------------------------
+
+
 def env_bool(name: str, default: str = "false") -> bool:
     return getenv(name, default).strip().lower() in {"1", "true", "yes", "on"}
 
@@ -163,6 +199,17 @@ def env_decimal(name: str, default: str) -> Decimal:
     return Decimal(default if raw is None or raw.strip() == "" else raw)
 
 
+def build_provider(http_url: str, wss_url: str = "") -> Any:
+    """Return a WSS provider if a WSS URL is available, otherwise HTTP."""
+    if wss_url and wss_url.startswith("wss://"):
+        try:
+            from web3.providers.persistent import WebSocketProvider  # type: ignore
+            return WebSocketProvider(wss_url)
+        except Exception:
+            pass
+    return AsyncHTTPProvider(http_url)
+
+
 def load_settings() -> Settings:
     required = {
         "GRAPH_API_KEY": getenv("GRAPH_API_KEY", ""),
@@ -175,6 +222,9 @@ def load_settings() -> Settings:
     if missing:
         raise RuntimeError(f"Missing environment variables: {', '.join(missing)}")
 
+    raw_subgraph = getenv("AAVE_SUBGRAPH_URL", "")
+    subgraph_url = raw_subgraph if raw_subgraph else DEFAULT_AAVE_SUBGRAPH_URL
+
     return Settings(
         graph_api_key=required["GRAPH_API_KEY"],
         rpc_url=required["BASE_RPC_URL"],
@@ -182,7 +232,7 @@ def load_settings() -> Settings:
         private_key=required["PRIVATE_KEY"],
         wallet_address=required["WALLET_ADDRESS"],
         hands_contract=getenv("HANDS_CONTRACT", DEFAULT_HANDS_CONTRACT),
-        subgraph_url=getenv("AAVE_SUBGRAPH_URL", DEFAULT_AAVE_SUBGRAPH_URL),
+        subgraph_url=subgraph_url,
         pool_addresses_provider=getenv("POOL_ADDRESSES_PROVIDER", DEFAULT_POOL_ADDRESSES_PROVIDER),
         chain_id=env_int("CHAIN_ID", 8453),
         execution_enabled=env_bool("EXECUTION_ENABLED", "true"),
@@ -197,7 +247,40 @@ def load_settings() -> Settings:
         base_currency_decimals=env_int("BASE_CURRENCY_DECIMALS", 8),
         require_gas_estimate=env_bool("REQUIRE_GAS_ESTIMATE", "true"),
         use_private_transaction_method=env_bool("USE_PRIVATE_TRANSACTION_METHOD", "false"),
+        base_wss_url=getenv("BASE_WSS_URL", ""),
+        private_wss_url=getenv("PRIVATE_WSS_URL", ""),
+        min_collateral_coverage=env_decimal("MIN_COLLATERAL_COVERAGE", "1.01"),
     )
+
+
+# ---------------------------------------------------------------------------
+# ETH price oracle (fetches live price for accurate gas cost in USD)
+# ---------------------------------------------------------------------------
+
+_eth_price_cache: dict[str, Any] = {"price": Decimal("3000"), "ts": 0.0}
+_ETH_PRICE_TTL = 60  # seconds
+
+
+async def fetch_live_eth_price(session: aiohttp.ClientSession) -> Decimal:
+    """Fetch ETH/USD price from CoinGecko. Caches result for 60 s."""
+    now = time.time()
+    if now - _eth_price_cache["ts"] < _ETH_PRICE_TTL:
+        return _eth_price_cache["price"]
+    try:
+        url = "https://api.coingecko.com/api/v3/simple/price?ids=ethereum&vs_currencies=usd"
+        async with session.get(url, timeout=aiohttp.ClientTimeout(total=5)) as resp:
+            data = await resp.json(content_type=None)
+            price = Decimal(str(data["ethereum"]["usd"]))
+            _eth_price_cache["price"] = price
+            _eth_price_cache["ts"] = now
+            return price
+    except Exception:
+        return _eth_price_cache["price"]
+
+
+# ---------------------------------------------------------------------------
+# Main bot class
+# ---------------------------------------------------------------------------
 
 
 class BaseSearcher:
@@ -224,6 +307,8 @@ class BaseSearcher:
             "liquidation": [],
             "rebalance_watchlist": [],
         }
+        # Shared aiohttp session for the bot lifetime
+        self._session: aiohttp.ClientSession | None = None
 
     def _address_set(self, csv_value: str) -> set[str]:
         return {
@@ -235,7 +320,14 @@ class BaseSearcher:
     def log(self, level: str, **payload: Any) -> None:
         print(json.dumps({"level": level, **payload}, default=str), flush=True)
 
-    def record_opportunity(self, kind: str, position: BorrowerPosition, estimated_profit_usd: Decimal, status: str, tx_hash: str | None = None) -> None:
+    def record_opportunity(
+        self,
+        kind: str,
+        position: BorrowerPosition,
+        estimated_profit_usd: Decimal,
+        status: str,
+        tx_hash: str | None = None,
+    ) -> None:
         bucket = self.opportunities.setdefault(kind, [])
         bucket.append(
             {
@@ -274,27 +366,41 @@ class BaseSearcher:
         return {"last24h": summary}
 
     async def start(self) -> None:
-        await self.validate_runtime()
-        pool_address = await self.provider.functions.getPool().call()
-        self.pool = self.public_w3.eth.contract(
-            address=self.public_w3.to_checksum_address(pool_address),
-            abi=POOL_ABI,
-        )
-        self.log(
-            "info",
-            message="bot_started",
-            wallet=self.account.address,
-            pool=self.pool.address,
-            executionEnabled=self.settings.execution_enabled,
-        )
-        while True:
-            try:
-                await self.tick()
-            except Exception as exc:
-                self.log("error", message=str(exc))
-                await asyncio.sleep(self.settings.heartbeat_seconds)
+        connector = aiohttp.TCPConnector(limit=50, ttl_dns_cache=300)
+        self._session = aiohttp.ClientSession(connector=connector)
+        try:
+            await self.validate_runtime()
+            pool_address = await self.provider.functions.getPool().call()
+            self.pool = self.public_w3.eth.contract(
+                address=self.public_w3.to_checksum_address(pool_address),
+                abi=POOL_ABI,
+            )
+            self.log(
+                "info",
+                message="bot_started",
+                wallet=self.account.address,
+                pool=self.pool.address,
+                handsContract=self.settings.hands_contract,
+                chainId=self.settings.chain_id,
+                executionEnabled=self.settings.execution_enabled,
+                subgraphUrl=self.settings.subgraph_url,
+                flashloanFeeBps=str(self.settings.flashloan_fee_bps),
+                minCollateralCoverage=str(self.settings.min_collateral_coverage),
+                minProfitUsd=str(self.settings.min_profit_usd),
+                status="hunting_on_mainnet" if self.settings.execution_enabled else "dry_run",
+            )
+            while True:
+                try:
+                    await self.tick()
+                except Exception as exc:
+                    self.log("error", message=str(exc))
+                    await asyncio.sleep(self.settings.heartbeat_seconds)
+        finally:
+            if self._session and not self._session.closed:
+                await self._session.close()
 
     async def validate_runtime(self) -> None:
+        self.log("info", message="validating_runtime", rpcUrl=self.settings.rpc_url)
         if not await self.public_w3.is_connected():
             raise RuntimeError("BASE_RPC_URL connection failed")
         if not await self.private_w3.is_connected():
@@ -303,26 +409,48 @@ class BaseSearcher:
         private_chain_id = await self.private_w3.eth.chain_id
         if chain_id != self.settings.chain_id or private_chain_id != self.settings.chain_id:
             raise RuntimeError(
-                f"Expected Base chain id {self.settings.chain_id}; got public={chain_id}, private={private_chain_id}"
+                f"Expected Base chain id {self.settings.chain_id}; "
+                f"got public={chain_id}, private={private_chain_id}"
             )
         configured_wallet = self.public_w3.to_checksum_address(self.settings.wallet_address)
         if configured_wallet != self.account.address:
             raise RuntimeError("WALLET_ADDRESS does not match PRIVATE_KEY")
+        self.log("info", message="runtime_validated", chainId=chain_id)
 
     async def tick(self) -> None:
         positions = await self.fetch_top_borrowers()
         candidates = self.pick_candidates(positions)
         rebalance_watchlist = self.pick_rebalance_watchlist(positions)
         for candidate in candidates:
-            self.record_opportunity("liquidation", candidate.position, candidate.estimated_profit_usd, "candidate")
+            self.record_opportunity(
+                "liquidation", candidate.position, candidate.estimated_profit_usd, "candidate"
+            )
         for position in rebalance_watchlist:
             self.record_opportunity("rebalance_watchlist", position, Decimal("0"), "watching")
 
         executed = 0
+        skipped_slippage = 0
         if candidates and self.settings.execution_enabled:
             for candidate in candidates[: self.settings.max_candidates_per_tick]:
+                if not self.passes_slippage_guard(candidate):
+                    self.log(
+                        "warn",
+                        message="slippage_guard_rejected",
+                        user=candidate.position.user,
+                        collateralUsd=str(candidate.position.collateral_base_usd),
+                        debtUsd=str(candidate.position.debt_base_usd),
+                        estimatedProfitUsd=str(candidate.estimated_profit_usd),
+                    )
+                    skipped_slippage += 1
+                    continue
                 tx_hash = await self.execute_candidate(candidate)
-                self.record_opportunity("liquidation", candidate.position, candidate.estimated_profit_usd, "sent", tx_hash)
+                self.record_opportunity(
+                    "liquidation",
+                    candidate.position,
+                    candidate.estimated_profit_usd,
+                    "sent",
+                    tx_hash,
+                )
                 executed += 1
                 self.log(
                     "info",
@@ -334,7 +462,11 @@ class BaseSearcher:
                     estimatedProfitUsd=candidate.estimated_profit_usd,
                 )
         elif candidates:
-            self.log("info", message="candidates_found_execution_disabled", candidates=len(candidates))
+            self.log(
+                "info",
+                message="candidates_found_execution_disabled",
+                candidates=len(candidates),
+            )
 
         if rebalance_watchlist:
             self.log(
@@ -358,10 +490,39 @@ class BaseSearcher:
             candidates=len(candidates),
             rebalanceWatchlist=len(rebalance_watchlist),
             executed=executed,
+            skippedSlippage=skipped_slippage,
             executionEnabled=self.settings.execution_enabled,
             opportunitySummary=self.opportunity_summary(),
         )
         await asyncio.sleep(self.settings.heartbeat_seconds)
+
+    # -----------------------------------------------------------------------
+    # Slippage / profitability guard
+    # -----------------------------------------------------------------------
+
+    def passes_slippage_guard(self, candidate: Candidate) -> bool:
+        """
+        Reject the liquidation if the collateral seized does not cover the
+        flash loan debt + fee + gas by at least MIN_COLLATERAL_COVERAGE (1%).
+
+        Aave V3 allows liquidating up to 50 % of the debt (close factor).
+        Bonus = liquidation_bonus_bps of the debt repaid.
+        Required:  collateral_received >= (debt_repaid + flash_fee + gas) * coverage
+        """
+        position = candidate.position
+        debt_repaid = position.debt_base_usd / Decimal("2")
+        flash_fee = debt_repaid * self.settings.flashloan_fee_bps / BPS
+        gas_usd = self.estimate_gas_fee_usd(650_000)
+        total_cost = (debt_repaid + flash_fee + gas_usd) * self.settings.min_collateral_coverage
+
+        bonus_amount = debt_repaid * self.settings.liquidation_bonus_bps / BPS
+        collateral_received = debt_repaid + bonus_amount
+
+        return collateral_received >= total_cost
+
+    # -----------------------------------------------------------------------
+    # Subgraph
+    # -----------------------------------------------------------------------
 
     async def fetch_top_borrowers(self) -> list[BorrowerPosition]:
         if self.pool is None:
@@ -386,15 +547,16 @@ class BaseSearcher:
         headers = {"Authorization": f"Bearer {self.settings.graph_api_key}"}
         variables = {"first": min(self.settings.subgraph_page_size, self.settings.borrower_limit * 10)}
         timeout = aiohttp.ClientTimeout(total=25)
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.post(
-                self.settings.subgraph_url,
-                json={"query": query, "variables": variables},
-                headers=headers,
-            ) as response:
-                payload = await response.json(content_type=None)
-                if response.status >= 400:
-                    raise RuntimeError(f"Subgraph HTTP {response.status}: {payload}")
+        session = self._session or aiohttp.ClientSession()
+        async with session.post(
+            self.settings.subgraph_url,
+            json={"query": query, "variables": variables},
+            headers=headers,
+            timeout=timeout,
+        ) as response:
+            payload = await response.json(content_type=None)
+            if response.status >= 400:
+                raise RuntimeError(f"Subgraph HTTP {response.status}: {payload}")
 
         if payload.get("errors"):
             raise RuntimeError(f"Subgraph errors: {payload['errors']}")
@@ -477,6 +639,10 @@ class BaseSearcher:
             data[user] = (int(decoded[0]), int(decoded[1]), int(decoded[5]))
         return data
 
+    # -----------------------------------------------------------------------
+    # Candidate selection
+    # -----------------------------------------------------------------------
+
     def pick_candidates(self, positions: list[BorrowerPosition]) -> list[Candidate]:
         picked = []
         for position in positions:
@@ -489,26 +655,49 @@ class BaseSearcher:
         return picked
 
     def pick_rebalance_watchlist(self, positions: list[BorrowerPosition]) -> list[BorrowerPosition]:
+        ceiling = Decimal(getenv("REBALANCE_HEALTH_FACTOR_CEILING", "1.05"))
         watchlist = [
             position
             for position in positions
-            if Decimal("1") <= position.health_factor < Decimal(getenv("REBALANCE_HEALTH_FACTOR_CEILING", "1.05"))
+            if Decimal("1") <= position.health_factor < ceiling
         ]
         watchlist.sort(key=lambda item: item.health_factor)
         return watchlist
 
+    # -----------------------------------------------------------------------
+    # Profit estimation
+    # -----------------------------------------------------------------------
+
     def estimate_liquidation_profit(self, position: BorrowerPosition) -> Decimal:
+        """
+        Aave V3 close factor = 50 % of outstanding debt.
+        Liquidation bonus (default 5 %) is applied to the debt repaid.
+        Flash loan fee = 9 bps of the debt repaid.
+        Gas is estimated from env ASSUMED_BASE_FEE_GWEI / ASSUMED_PRIORITY_FEE_GWEI.
+        """
         close_factor_debt = position.debt_base_usd / Decimal("2")
         bonus = close_factor_debt * self.settings.liquidation_bonus_bps / BPS
         flash_fee = close_factor_debt * self.settings.flashloan_fee_bps / BPS
-        gas_fee = self.estimate_gas_fee_usd(650000)
+        gas_fee = self.estimate_gas_fee_usd(650_000)
         return bonus - flash_fee - gas_fee
 
     def estimate_gas_fee_usd(self, gas_units: int) -> Decimal:
+        """
+        Gas cost in USD using environment-configured assumptions.
+        ETH_PRICE_USD defaults to 3000 (override from env or live cache).
+        ASSUMED_BASE_FEE_GWEI and ASSUMED_PRIORITY_FEE_GWEI drive the gas price.
+        """
         base_fee_gwei = Decimal(getenv("ASSUMED_BASE_FEE_GWEI", "0.02"))
-        eth_price = Decimal(getenv("ETH_PRICE_USD", "3000"))
-        priority_gwei = min(self.settings.max_priority_fee_cap_gwei, Decimal(getenv("ASSUMED_PRIORITY_FEE_GWEI", "0.04")))
+        eth_price = _eth_price_cache.get("price", Decimal("3000"))
+        priority_gwei = min(
+            self.settings.max_priority_fee_cap_gwei,
+            Decimal(getenv("ASSUMED_PRIORITY_FEE_GWEI", "0.04")),
+        )
         return (base_fee_gwei + priority_gwei) * Decimal(gas_units) * eth_price / Decimal("1000000000")
+
+    # -----------------------------------------------------------------------
+    # Execution
+    # -----------------------------------------------------------------------
 
     async def execute_candidate(self, candidate: Candidate) -> str:
         tx = await self.build_liquidation_tx(candidate)
@@ -541,44 +730,58 @@ class BaseSearcher:
             return int(Decimal(estimated) * Decimal("1.25"))
         except Exception as exc:
             if self.settings.require_gas_estimate:
-                raise RuntimeError(f"Gas estimate failed; refusing to send likely reverting tx: {exc}") from exc
-            return 650000
+                raise RuntimeError(
+                    f"Gas estimate failed; refusing to send likely reverting tx: {exc}"
+                ) from exc
+            return 650_000
 
     async def dynamic_fees(self, profit_usd: Decimal) -> dict[str, int]:
+        """
+        EIP-1559 fee strategy:
+          maxPriorityFeePerGas = min(2 gwei cap, 4% of profit / gas_units)
+          maxFeePerGas = 2 * baseFee + priorityFee
+        Using live block baseFeePerGas for accuracy.
+        Gas payment uses the private (EOA direct) RPC — no paymaster involved.
+        """
         block = await self.private_w3.eth.get_block("latest")
         base_fee = int(block.get("baseFeePerGas", self.private_w3.to_wei(Decimal("0.02"), "gwei")))
-        eth_price = Decimal(getenv("ETH_PRICE_USD", "3000"))
+        eth_price = _eth_price_cache.get("price", Decimal("3000"))
         max_tip_usd = min(Decimal("2"), profit_usd * Decimal("0.04"))
-        priority_wei = int(max_tip_usd / eth_price * Decimal("1000000000000000000") / Decimal("650000"))
-        priority_wei = max(priority_wei, int(self.private_w3.to_wei(Decimal("0.001"), "gwei")))
-        priority_wei = min(priority_wei, int(self.private_w3.to_wei(self.settings.max_priority_fee_cap_gwei, "gwei")))
-        return {
-            "maxFeePerGas": base_fee * 2 + priority_wei,
-            "maxPriorityFeePerGas": priority_wei,
-        }
+        priority_wei = int(
+            max_tip_usd / eth_price * Decimal("1000000000000000000") / Decimal("650000")
+        )
+        cap_wei = self.private_w3.to_wei(self.settings.max_priority_fee_cap_gwei, "gwei")
+        priority_fee = min(priority_wei, int(cap_wei))
+        max_fee = (2 * base_fee) + priority_fee
+        return {"maxFeePerGas": max_fee, "maxPriorityFeePerGas": priority_fee}
 
-    async def rpc_request(self, method: str, params: list[Any]) -> Any:
-        response = await self.private_w3.provider.make_request(RPCEndpoint(method), params)
-        if response.get("error"):
-            raise RuntimeError(response["error"])
-        return response.get("result")
-
-    async def send_private_transaction(self, raw_tx: HexBytes) -> str:
-        raw_hex = raw_tx.hex()
+    async def send_private_transaction(self, raw: HexBytes) -> str:
         if self.settings.use_private_transaction_method:
-            try:
-                result = await self.rpc_request("eth_sendPrivateTransaction", [{"tx": raw_hex}])
-                if result:
-                    return str(result)
-            except Exception as exc:
-                self.log("warning", message="private_transaction_method_failed_falling_back", error=str(exc))
-        tx_hash = await self.private_w3.eth.send_raw_transaction(HexBytes(raw_tx))
+            result = await self.private_w3.provider.make_request(
+                RPCEndpoint("eth_sendRawTransaction"),
+                [raw.hex()],
+            )
+            if "error" in result:
+                raise RuntimeError(f"Private RPC error: {result['error']}")
+            return result["result"]
+        tx_hash = await self.private_w3.eth.send_raw_transaction(raw)
         return tx_hash.hex()
 
 
+# ---------------------------------------------------------------------------
+# Entry point
+# ---------------------------------------------------------------------------
+
+
 async def main() -> None:
-    load_dotenv(override=True)
+    load_dotenv()
     settings = load_settings()
+
+    # Kick off background ETH price refresh so first tick has a live price
+    connector = aiohttp.TCPConnector(limit=10)
+    async with aiohttp.ClientSession(connector=connector) as price_session:
+        await fetch_live_eth_price(price_session)
+
     searcher = BaseSearcher(settings)
     await searcher.start()
 
